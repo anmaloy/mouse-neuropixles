@@ -85,9 +85,9 @@ class NeuralDataProcessor:
             mad = np.median(np.abs(centered_trace)) / 0.6745
 
             if direction == "negative":
-                threshold = np.median(traces[:, ch]) - (7.0 * mad)  # Lower threshold for downward spikes
+                threshold = np.median(traces[:, ch]) - (5.0 * mad)  # Lower threshold for downward spikes
             elif direction == "positive":
-                threshold = np.median(traces[:, ch]) + (7.0 * mad)  # Upper threshold for upward spikes
+                threshold = np.median(traces[:, ch]) + (5.0 * mad)  # Upper threshold for upward spikes
             else:
                 raise ValueError("Invalid direction! Choose 'negative' or 'positive'.")
 
@@ -591,7 +591,7 @@ def configure_experiment():
     """Defines experiment metadata and paths."""
     config = {
         "rerun": True,
-        "sglx_folder": "C:/SGL_DATA",
+        "sglx_folder": "SGL_DATA",
         "mouse_id": "testMouse",
         "gate": "0",
         "probe": "0",
@@ -599,9 +599,9 @@ def configure_experiment():
         "channels_sample": (10, 15),
         "skip_sort": True,
         "write_concat": False,
-        "mua_method": "threshold",
-        "processing_folder": "C:/ProjectCode/Python/mouse-neuropixles/processing",
-        "direction": "positive"  # Can be "negative" or "positive"
+        "mua_method": "kilosort",
+        "processing_folder": "processing",
+        "direction": "negative"  # Can be "negative" or "positive"
     }
 
     # Define paths **after** initializing config
@@ -643,10 +643,10 @@ if __name__ == "__main__":
 
     # Step 5: Visualization
     print("\nGenerating plots...\n")
-    # processor.plot_filtered_traces()  # Plot threshold-based spike detection
-    # processor.plot_mua_activity()  # Plot MUA event count per channel
+    processor.plot_filtered_traces()  # Plot threshold-based spike detection
+    processor.plot_mua_activity()  # Plot MUA event count per channel
     processor.plot_raster_heatmap()
-    # processor.plot_ap_amplitudes()  # Plot action potential amplitude distributions
+    processor.plot_ap_amplitudes()  # Plot action potential amplitude distributions
     # processor.plot_waveform_traces()  # Plot individual spike waveforms
     # processor.plot_channel_templates()  # Plot template waveforms for selected channels
     # processor.plot_probe_layout()  # Plot probe layout
