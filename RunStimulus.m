@@ -1,4 +1,4 @@
-% Start matlab with ptb3-matlab DriftDemo.m
+% Start matlab with ptb3-matlab RunStimulus.m
 try
     Screen('Preference', 'SkipSyncTests', 1);
     Screen('Preference', 'VisualDebugLevel', 3);
