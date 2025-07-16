@@ -5,6 +5,10 @@ try
 
     rng(1, "twister"); % random seed
 
+    % Establish serial connection to Arduino
+    arduino_port = serialport("COM4", 9600);  % <- Replace COM4 with correct port (run serialportlist)
+    pause(2);  % Wait for Arduino to reset
+
     AssertOpenGL;
 
     % Get the list of screens and choose the one with the highest screen number.
@@ -127,6 +131,9 @@ try
     
     % Run trials
     for k = 1:numtrials      
+        %% Send TTL ON
+        write(arduino_port, '1', "char");
+        
         for i = 1:movieDurationFrames
             % Check for key press to exit
             [keyIsDown, ~, keyCode] = KbCheck;
@@ -141,6 +148,9 @@ try
             Screen('FillRect', w,[255 255 255],[0 0 200 200]); % Photodiode indicator
             Screen('Flip', w);
         end
+
+        % Send TTL OFF
+        write(arduino_port, '0', "char");
     
         % Inter-trial interval
         for i = 1:ITIDurationFrames
@@ -158,6 +168,9 @@ try
     Screen('Close');
     sca;
     save Stimlog blockdesign angles;
+
+    % Close the serial port cleanly
+    clear arduino_port;
 
 catch
     % Catch errors and close gracefully
