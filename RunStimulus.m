@@ -127,35 +127,42 @@ try
         end
     end
 
-
-    
     % Run trials
     for k = 1:numtrials      
-        %% Send TTL ON
-        write(arduino_port, '1', "char");
+        sentTTL = false;  % reset for each trial
         
         for i = 1:movieDurationFrames
             % Check for key press to exit
             [keyIsDown, ~, keyCode] = KbCheck;
-            if keyIsDown && keyCode(KbName('ESCAPE'))  % Exit on 'q' key
-                sca;  % Close the window
+            if keyIsDown && keyCode(KbName('ESCAPE'))
+                sca;
                 return;
             end
             
-            % Draw image:
-            Screen('DrawTexture', w, tex(blockdesign(k),movieFrameIndices(i)));
-            % Draws white box
-            Screen('FillRect', w,[255 255 255],[0 0 200 200]); % Photodiode indicator
-            Screen('Flip', w);
+            % Draw current stimulus frame into back buffer
+            Screen('DrawTexture', w, tex(blockdesign(k), movieFrameIndices(i)));
+
+            % Photodiode box so you can still scope it
+            Screen('FillRect', w, [255 255 255], [0 0 200 200]);
+
+            % Flip to front buffer at VSync.
+            % This call blocks until the monitor actually presents (or is about to present) the new frame.
+            [vblTimestamp, stimOnset] = Screen('Flip', w);
+
+            % Send TTL ON immediately after first actual presented frame of this trial
+            if ~sentTTL
+                write(arduino_port, '1', "char");
+                sentTTL = true;
+            end
         end
 
-        % Send TTL OFF
+        % All frames for this trial are done. Drop TTL.
         write(arduino_port, '0', "char");
     
-        % Inter-trial interval
+        % Inter-trial interval (blank / gray frames, no TTL high)
         for i = 1:ITIDurationFrames
             [keyIsDown, ~, keyCode] = KbCheck;
-            if keyIsDown && keyCode(KbName('ESCAPE'))  % Check again during ITI
+            if keyIsDown && keyCode(KbName('ESCAPE'))
                 sca;
                 return;
             end
