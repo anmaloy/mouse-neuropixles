@@ -2406,8 +2406,3 @@ if __name__ == "__main__":
     # processor.plot_ap_amplitudes()  # Plot action potential amplitude distributions
     # processor.plot_waveform_traces()  # Plot individual spike waveforms
     # processor.plot_channel_templates()  # Plot template waveforms for selected channels
-
-# todo
-# Run for all promising gates and take a look
-# Ask about reducing unit count
-# Map to best fit channel?? It feels like theres a lot more than 300 units plotted
