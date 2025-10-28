@@ -237,7 +237,7 @@ class ProcessUnit:
             self.square_wave_alignment["offsets"]
             self.square_wave_alignment["cumulative"]
         """
-        def detect_rising_edges(trace, time, min_interval=5.0):
+        def detect_rising_edges(trace, time, min_interval=0.25):
             trace = np.asarray(trace)
             threshold = 0.5 * np.max(trace)
             binary = (trace > threshold).astype(np.uint8)
@@ -259,7 +259,7 @@ class ProcessUnit:
         nidq = self.square_wave_data["nidq"]
 
         ap_times = detect_rising_edges(ap["trace"], ap["time"])
-        nidq_times = detect_rising_edges(nidq["trace"], nidq["time"])
+        nidq_times = detect_rising_edges(nidq["sync"], nidq["time"])
 
         if skip_edge_pulses:
             ap_times = ap_times[1:-1]
@@ -568,10 +568,50 @@ class ProcessUnit:
         xd0_trace = nidq_raw[:, 8].astype(np.int16)
         xd0_time = np.arange(len(xd0_trace)) / nidq_fs
 
+
+        xd0_raw = nidq_raw[:, 8].astype(np.uint16)
+        # Show which bits are used in XD0
+        unique_vals = np.unique(xd0_raw)
+        used_bits = set()
+        for val in unique_vals:
+            for bit in range(16):
+                if val & (1 << bit):
+                    used_bits.add(bit)
+
+        print(f"Bits used in XD0: {sorted(used_bits)}")
+
+        sync_trace = (xd0_raw & (1 << 0)) > 0  # Sync signal
+        stim_trace = (xd0_raw & (1 << 2)) > 0  # Stimulus signal
+
+        # Swaps photodiode onset for TTL onset
+        # ---------------------------------------
+        # Detect rising edges of the stimulus TTL (bit 2 of XD0) to get stimulus start times in NIDAQ clock
+        stim_binary = stim_trace.astype(np.uint8)
+        stim_rise_idx = np.where(np.diff(stim_binary) == 1)[0] + 1
+        stim_onsets_nidq = xd0_time[stim_rise_idx]
+
+        # Overwrite the photodiode-based onsets with TTL-based onsets
+        # Keep offsets as-is (photodiode) so segment ends still come from measured light offset
+        if hasattr(self, "nidaq_data"):
+            self.nidaq_data["light_onsets"] = stim_onsets_nidq
+        else:
+            # safety fallback, but in your call order load_nidaq() already ran so nidaq_data exists
+            self.nidaq_data = {
+                "light_onsets": stim_onsets_nidq,
+            }
+        # ------------------------------------
+
+        xd0_time = np.arange(len(sync_trace)) / nidq_fs
+
         # ---------- Store Results ----------
         self.square_wave_data = {
             "ap": {"trace": sy0_trace, "time": sy0_time, "fs": ap_fs},
-            "nidq": {"trace": xd0_trace, "time": xd0_time, "fs": nidq_fs}
+            "nidq": {
+                "sync": sync_trace.astype(np.uint8),
+                "stim": stim_trace.astype(np.uint8),
+                "time": xd0_time,
+                "fs": nidq_fs
+            }
         }
 
         print(f"Loaded SY0 from AP: {len(sy0_trace)} samples at {ap_fs:.2f} Hz")
@@ -833,9 +873,9 @@ class ProcessUnit:
             ax.set_xlim(-14, 62)
 
             # Channel tick labels
-            tick_spacing = 20
+            tick_spacing = 15   # 15 for 2.0, 20 for 1.0
             tick_indices = np.arange(0, max(channel_id_map) + 1, tick_spacing)
-            tick_positions = 20 * ((tick_indices - 1) // 2)
+            tick_positions = tick_spacing * ((tick_indices - 1) // 2)
             tick_labels = [str(ch) for ch in tick_indices]
 
             ax.set_yticks(tick_positions)
@@ -927,9 +967,9 @@ class ProcessUnit:
         ])
 
         # Tick every N channels, align to correct rows
-        tick_spacing = 20
+        tick_spacing = 15  # 15 for 2.0, 20 for 1.0
         tick_indices = np.arange(0, channel_positions.max() + 1, tick_spacing)
-        tick_positions = 20 * ((tick_indices - 1) // 2)
+        tick_positions = tick_spacing * ((tick_indices - 1) // 2)
         tick_labels = [str(ch) for ch in tick_indices]
 
         ax.set_yticks(tick_positions)
@@ -1068,10 +1108,12 @@ class ProcessUnit:
             ax.plot(xdata, ydata, color=line.get_color(), linewidth=line.get_linewidth())
 
         plt.close(fig_temp)
-        ax.set_ylim(60, -90)
+        # Defines tick labels and range (mV), include to define range and hide labels
+        # ax.set_ylim(60, -90)
         ax.set_xticks([])
-        ax.set_yticklabels([])
-        ax.set_ylabel("")
+        # ax.set_yticklabels([])
+        ax.set_ylabel("mV", fontsize=4, rotation=0, labelpad=2)
+        ax.yaxis.set_label_coords(0, -0.05)
         ax.tick_params(axis='y', labelsize=4)
 
     def process_analyzer(self):
@@ -1431,15 +1473,15 @@ def configure_experiment():
     config = {
         "rerun": False,
         "sglx_folder": "SGL_DATA",
-        "mouse_id": "mouse01",
-        "gate": "6",
+        "mouse_id": "Mouse03",
+        "gate": "5",
         "probe": "0",
         "skip_sort": True,
         "write_concat": False,
         "processing_folder": "processing",
         "show_plot": False,
-        "insertion_depth": 3002,
-        "run_phy": True
+        "insertion_depth": 3000,
+        "run_phy": False
     }
 
     # Define paths **after** initializing config
@@ -1474,8 +1516,8 @@ if __name__ == "__main__":
     probe = processor.recording.get_probe()
     processor.run_kilosort()
     processor.process_analyzer()
-    processor.plot_raw_spike_alignment(80)
-    exit()
+    # processor.plot_raw_spike_alignment(80)
+    # exit()
     processor.plot_direction_evocation()
     processor.plot_light_evocation()
     processor.plot_unit_spiking_data()
