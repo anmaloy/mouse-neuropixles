@@ -1779,7 +1779,7 @@ def configure_experiment():
         "rerun": True,
         "sglx_folder": "SGL_DATA",
         "mouse_id": "mouse05",
-        "gate": "0",
+        "gate": "1",
         "probe": "0",
         "skip_sort": True,
         "write_concat": False,
