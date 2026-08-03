@@ -8,6 +8,134 @@ import shutil
 import subprocess
 import spikeinterface.core as sic
 import spikeinterface.extractors as se
+import scipy.spatial.distance as _distance
+from scipy.ndimage import median_filter, uniform_filter1d, minimum_filter1d, maximum_filter1d
+
+
+# ===========================================================================
+# Photodiode transition detection (Allen ecephys stimulus_sync method).
+# See scripts/photodiode_standalone.py for the standalone version + tests.
+# The signal is thresholded loosely into raw transitions, then the transition
+# SEQUENCE is reconciled against the known 500/500 ms trial periodicity.
+# ===========================================================================
+SMOOTH_MS = 60.0        # median-filter window: wider than the ~11 Hz monitor
+                        # ripple, far narrower than the 500 ms trial.
+HALF_PERIOD_S = 0.5     # ON == OFF == 0.5 s during the trial run.
+NDEVS = 10              # flag_unexpected_edges deviation threshold (Allen).
+MAX_HALF_OFFSET = 4     # fix_unexpected_edges snap tolerance (Allen).
+DEBOUNCE_FRAC = 0.5     # drop raw transitions closer than this * half-period.
+RUN_GAP_S = 2.0         # a gap longer than this ends the contiguous run.
+LOCK_TOL = 0.08         # cadence-lock tolerance (photodiode-only fallback).
+SNAP_WIN_S = 0.15       # TTL-edge -> nearest-photodiode-edge snap window.
+
+
+def trimmed_stats(data, pctiles=(10, 90)):
+    """Robust mean/std ignoring the tails. Allen verbatim."""
+    low = np.percentile(data, pctiles[0])
+    high = np.percentile(data, pctiles[1])
+    trimmed = data[np.logical_and(data <= high, data >= low)]
+    return np.mean(trimmed), np.std(trimmed)
+
+
+def flag_unexpected_edges(pd_times, ndevs=NDEVS):
+    """Mask (1=expected, 0=unexpected) of inter-transition intervals deviating
+    from the trimmed mean by more than ndevs std. Allen verbatim."""
+    pd_diff = np.diff(pd_times)
+    diff_mean, diff_std = trimmed_stats(pd_diff)
+    mask = np.ones(pd_diff.size)
+    mask[np.logical_or(pd_diff < diff_mean - ndevs * diff_std,
+                       pd_diff > diff_mean + ndevs * diff_std)] = 0
+    mask[1:] = np.logical_and(mask[:-1], mask[1:])
+    mask = np.concatenate([mask, [mask[-1]]])
+    return mask
+
+
+def fix_unexpected_edges(pd_times, ndevs=NDEVS, cycle=1, max_frame_offset=MAX_HALF_OFFSET):
+    """Repair the transition sequence against the expected interval: insert
+    missed edges, drop spurious ones, on the expected grid. Allen verbatim
+    (cycle=1 for the trial-transition cadence rather than 60 monitor frames)."""
+    pd_times = np.array(pd_times, dtype=float)
+    expected_duration_mask = flag_unexpected_edges(pd_times, ndevs=ndevs)
+    diff_mean, diff_std = trimmed_stats(np.diff(pd_times))
+    frame_interval = diff_mean / cycle
+
+    bad_edges = np.where(expected_duration_mask == 0)[0]
+    if bad_edges.size == 0:
+        return pd_times
+
+    bad_blocks = np.sort(np.unique(np.concatenate([
+        [0], np.where(np.diff(bad_edges) > 1)[0] + 1, [len(bad_edges)]])))
+
+    output_edges = np.array([], dtype=float)
+    for low, high in zip(bad_blocks[:-1], bad_blocks[1:]):
+        current_bad_edge_indices = bad_edges[low: high - 1]
+        if current_bad_edge_indices.size == 0:
+            continue
+        current_bad_edges = pd_times[current_bad_edge_indices]
+        low_bound = pd_times[current_bad_edge_indices[0]]
+        high_bound = pd_times[current_bad_edge_indices[-1] + 1]
+        edges_missing = int(np.around((high_bound - low_bound) / diff_mean))
+        expected = np.linspace(low_bound, high_bound, edges_missing + 1)
+        distances = _distance.cdist(current_bad_edges[:, None], expected[:, None])
+        distances = np.around(distances / frame_interval).astype(int)
+        min_offsets = np.amin(distances, axis=0)
+        min_offset_indices = np.argmin(distances, axis=0)
+        output_edges = np.concatenate([
+            output_edges,
+            expected[min_offsets > max_frame_offset],
+            current_bad_edges[min_offset_indices[min_offsets <= max_frame_offset]]])
+
+    return np.sort(np.concatenate([output_edges, pd_times[expected_duration_mask > 0]]))
+
+
+def correct_on_off_effects(pd_times):
+    """Remove the systematic ON->OFF vs OFF->ON timing asymmetry. Allen verbatim."""
+    pd_times = np.array(pd_times, dtype=float)
+    pd_diff = np.diff(pd_times)
+    odd_diff_mean, _ = trimmed_stats(pd_diff[1::2])
+    even_diff_mean, _ = trimmed_stats(pd_diff[0::2])
+    half_diff = np.diff(pd_times[0::2])
+    full_period_mean, _ = trimmed_stats(half_diff)
+    half_period_mean = full_period_mean / 2
+    pd_times[::2] -= (odd_diff_mean - half_period_mean) / 2
+    pd_times[1::2] -= (even_diff_mean - half_period_mean) / 2
+    return pd_times
+
+
+def extract_raw_transitions(signal, fs):
+    """Loose detection of every gray<->ON transition, via drift-tracking
+    hysteresis on the median-smoothed level. Only has to be roughly right;
+    fix_unexpected_edges repairs the sequence afterwards."""
+    med_win = max(1, int(SMOOTH_MS * fs / 1000))
+    if med_win % 2 == 0:
+        med_win += 1
+    level = median_filter(np.asarray(signal, dtype=np.float64), size=med_win)
+
+    win = max(1, int(1.0 * fs))
+    loc_lo = minimum_filter1d(level, win, mode="nearest")
+    loc_hi = maximum_filter1d(level, win, mode="nearest")
+    mid = 0.5 * (loc_lo + loc_hi)
+    span = loc_hi - loc_lo
+    hi_thr = mid + 0.1 * span
+    lo_thr = mid - 0.1 * span
+
+    above = level > hi_thr
+    below = level < lo_thr
+    state = np.zeros(level.size, dtype=bool)
+    cur = False
+    prev = 0
+    for idx in np.where(above | below)[0]:
+        if above[idx] and not cur:
+            state[prev:idx] = cur; cur = True; prev = idx
+        elif below[idx] and cur:
+            state[prev:idx] = cur; cur = False; prev = idx
+    state[prev:] = cur
+
+    times = (np.where(np.diff(state.astype(np.int8)) != 0)[0] + 1) / fs
+    if times.size:
+        keep = np.concatenate([[True], np.diff(times) > (DEBOUNCE_FRAC * HALF_PERIOD_S)])
+        times = times[keep]
+    return times
 import spikeinterface.preprocessing as spre
 import spikeinterface.sorters as ss
 import spikeinterface.widgets as sw
@@ -37,7 +165,8 @@ class ProcessUnit:
         self.waveforms = None
         self.stim_directions = None
         self.sampling_rate = None
-        self.trial_drift_alpha = 0.0035
+        self.trial_drift_alpha = 0.0035  # Testing calibration drift.
+        self.unique_shanks = None
 
         if self.config["rerun"]:
             self.cleanup_previous_processing()
@@ -183,13 +312,14 @@ class ProcessUnit:
 
         spike_vector = self.sorting.to_spike_vector()
         all_spike_units = spike_vector["unit_index"]
-
         light_onsets = np.array(self.nidaq_data.get("light_onsets", []))
         light_offsets = np.array(self.nidaq_data.get("light_offsets", []))
         light_onsets *= int(self.sampling_rate)
         light_offsets *= int(self.sampling_rate)
 
         if len(light_onsets) != len(self.directions):
+            print('len(light_onsets)', len(light_onsets))
+            print('len(self.directions)', len(self.directions))
             raise ValueError("Mismatch between number of light_onsets and directions.")
 
         padding = int(0.25 * self.sampling_rate)
@@ -226,16 +356,19 @@ class ProcessUnit:
 
         return {"bin_centers": bin_centers, "firing_rates": firing_rates}
 
-    def calculate_square_alignment(self, skip_edge_pulses=False):
+    def calculate_square_alignment(self, skip_edge_pulses=False, first_pulse_tolerance=0.05, max_shift=5):
         """
         Calculates pulse onset times from square wave signals in AP (SY0) and NIDAQ (XD0),
-        then computes cumulative time correction needed to align NIDAQ to AP.
+        then computes time correction needed to align NIDAQ to AP.
+
+        It tolerates small mismatches in pulse counts by trimming extra pulses from the
+        longer sequence, preferring to drop pulses at the edges while enforcing that
+        the first matched pulses are aligned within 'first_pulse_tolerance' seconds.
 
         Stores:
             self.square_wave_alignment["ap_times"]
             self.square_wave_alignment["nidq_times"]
             self.square_wave_alignment["offsets"]
-            self.square_wave_alignment["cumulative"]
         """
         def detect_rising_edges(trace, time, min_interval=0.25):
             trace = np.asarray(trace)
@@ -255,6 +388,79 @@ class ProcessUnit:
 
             return np.array(grouped)
 
+        def align_pulse_trains(ap_times, nidq_times, tol, max_shift):
+            """
+            Trim extra pulses from the longer sequence while ensuring the first
+            aligned pulses are within tol seconds. Allows up to max_shift pulses
+            to be discarded from the leading edge to fix off-by-one.
+            """
+            n_ap = len(ap_times)
+            n_nidq = len(nidq_times)
+
+            if n_ap == 0 or n_nidq == 0:
+                raise ValueError("No pulses detected in one or both signals.")
+
+            if n_ap == n_nidq:
+                # Straightforward case
+                if abs(ap_times[0] - nidq_times[0]) > tol:
+                    raise ValueError(
+                        f"First AP/NIDAQ pulses misaligned by {abs(ap_times[0] - nidq_times[0]):.3f}s "
+                        f"(tolerance {tol}s)."
+                    )
+                return ap_times, nidq_times
+
+            # Determine which is longer
+            if n_ap > n_nidq:
+                longer = ap_times
+                shorter = nidq_times
+                longer_is_ap = True
+            else:
+                longer = nidq_times
+                shorter = ap_times
+                longer_is_ap = False
+
+            diff = abs(n_ap - n_nidq)
+            # Limit how many pulses we ever consider discarding at the front
+            max_shift = min(diff, max_shift)
+
+            best_shift = None
+            best_score = None
+
+            # Try discarding 0..max_shift pulses at the *front* of the longer train;
+            # the remaining extra pulses are implicitly discarded at the tail.
+            for shift in range(max_shift + 1):
+                if shift + len(shorter) > len(longer):
+                    break
+                cand_longer = longer[shift:shift + len(shorter)]
+
+                # Enforce first pulse alignment
+                if abs(cand_longer[0] - shorter[0]) > tol:
+                    continue
+
+                # Evaluate candidate by median absolute offset
+                offsets = shorter - cand_longer
+                score = np.median(np.abs(offsets))
+
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_shift = shift
+
+            if best_shift is None:
+                raise ValueError(
+                    f"Unable to align pulse trains with tolerance {tol}s "
+                    f"and up to {max_shift} leading-pulse shift."
+                )
+
+            # Build final aligned sequences
+            if longer_is_ap:
+                aligned_ap = longer[best_shift:best_shift + len(shorter)]
+                aligned_nidq = shorter
+            else:
+                aligned_ap = shorter
+                aligned_nidq = longer[best_shift:best_shift + len(shorter)]
+
+            return aligned_ap, aligned_nidq
+
         ap = self.square_wave_data["ap"]
         nidq = self.square_wave_data["nidq"]
 
@@ -265,19 +471,23 @@ class ProcessUnit:
             ap_times = ap_times[1:-1]
             nidq_times = nidq_times[1:-1]
 
-        if len(ap_times) != len(nidq_times):
-            raise ValueError(f"Mismatch in number of pulses: AP={len(ap_times)} vs NIDAQ={len(nidq_times)}")
+        # New robust alignment that tolerates mismatched pulse counts
+        ap_times_aligned, nidq_times_aligned = align_pulse_trains(
+            ap_times, nidq_times, tol=first_pulse_tolerance, max_shift=max_shift
+        )
 
-        offsets = nidq_times - ap_times
+        offsets = nidq_times_aligned - ap_times_aligned
 
         self.square_wave_alignment = {
-            "ap_times": ap_times,
-            "nidq_times": nidq_times,
-            "offsets": offsets
+            "ap_times": ap_times_aligned,
+            "nidq_times": nidq_times_aligned,
+            "offsets": offsets,
         }
-        # print(self.square_wave_alignment)
 
-        print(f"Extracted {len(ap_times)} AP pulses and {len(nidq_times)} NIDAQ pulses.")
+        print(
+            f"Extracted {len(ap_times)} AP pulses and {len(nidq_times)} NIDAQ pulses "
+            f"(aligned to {len(ap_times_aligned)} pulses)."
+        )
 
     def cleanup_previous_processing(self):
         """Deletes existing processed files if rerun is enabled."""
@@ -297,86 +507,137 @@ class ProcessUnit:
                     shutil.rmtree(path)
                 print(f"Deleted: {path}")
 
-    def detect_light_transitions(self, signal, trim_front=0, trim_end=0):
+    def detect_light_transitions(self, signal, trim_front=0, trim_end=0, ttl=None):
         """
-        Detects onset and offset points in the photodiode signal based on crossings of a dynamic threshold.
-        Refines detected times by moving backward to the point where the signal transitions from stable to rapid change.
-        Ensures that onset-offset pairs are within 50ms of 500ms apart.
-        Allows for trimming of detected events at the beginning and end.
+        Detect trial onsets/offsets in the photodiode signal (Allen ecephys
+        stimulus_sync method; see scripts/photodiode_standalone.py for the
+        standalone version and tests).
+
+        Replaces the old global-threshold + 500 ms +/- 50 ms duration gate, which
+        failed on session-long intensity drift and on the inconsistent crossing
+        point along each edge.
+
+        - If a clean stimulus TTL is supplied (XD0 bit 2, same NIDAQ clock), its
+          rising edges define the trial grid; each is snapped to the nearest
+          photodiode transition for the precise (canonical) optical time.
+          Warmup/ramp transitions with no TTL partner are dropped structurally.
+        - Otherwise: isolate the longest metronomic (0.5 s) cadence-locked run
+          and reconcile it with fix_unexpected_edges / correct_on_off_effects.
 
         Parameters:
-        - signal: The photodiode signal.
-        - trim_front: Time (in seconds) at the start of the recording where no detections are allowed.
-        - trim_end: Time (in seconds) at the end of the recording where no detections are allowed.
+        - signal: photodiode signal.
+        - trim_front / trim_end: seconds at start/end to exclude.
+        - ttl: optional binary stimulus-TTL trace (same length/clock as signal).
 
-        Returns:
-        - paired_onsets: Array of refined onset times.
-        - paired_offsets: Array of refined offset times.
+        Returns (paired_onsets, paired_offsets), seconds on the NIDAQ clock.
         """
         fs = self.nidaq_recording.get_sampling_frequency()
-        time_vector = np.arange(len(signal)) / fs
 
-        # Use the middle 20 seconds of the recording to compute a more stable baseline
-        total_duration = len(signal) / fs
-        mid_start_time = (total_duration / 2) - 10
-        mid_end_time = (total_duration / 2) + 10
-        mid_start_idx = int(mid_start_time * fs)
-        mid_end_idx = int(mid_end_time * fs)
-        middle_mean = np.mean(signal[mid_start_idx:mid_end_idx]) + 0.73*np.std(signal[mid_start_idx:mid_end_idx])
-        above_mean = signal > middle_mean
+        raw_times = extract_raw_transitions(signal, fs)
+        if raw_times.size < 4:
+            print("\tDetected 0 valid onset-offset pairs.")
+            return np.array([]), np.array([])
 
-        # Compute derivatives
-        first_derivative = np.diff(signal)
-        second_derivative = np.diff(first_derivative)
+        # ---- TTL-grid path (clean TTL present) ----
+        if ttl is not None and np.any(ttl):
+            ttl_arr = np.asarray(ttl).astype(np.int8)
+            ttl_rise = np.where(np.diff(ttl_arr) == 1)[0] / fs
+            if ttl_rise.size >= 4:
+                d = np.diff(ttl_rise)
+                if np.median(np.abs(d - np.median(d))) < 0.05:  # cadence-locked
+                    pd_trans = raw_times
+                    onsets, offsets = [], []
+                    win = SNAP_WIN_S
+                    for r in ttl_rise:
+                        j = np.searchsorted(pd_trans, r)
+                        cands = []
+                        if j < len(pd_trans):
+                            cands.append(pd_trans[j])
+                        if j > 0:
+                            cands.append(pd_trans[j - 1])
+                        if not cands:
+                            continue
+                        pd_on = min(cands, key=lambda x: abs(x - r))
+                        if abs(pd_on - r) > win:
+                            pd_on = r  # photodiode dropped this edge -> use TTL
+                        k = np.searchsorted(pd_trans, pd_on + HALF_PERIOD_S)
+                        off_cands = []
+                        if k < len(pd_trans):
+                            off_cands.append(pd_trans[k])
+                        if k > 0:
+                            off_cands.append(pd_trans[k - 1])
+                        target = pd_on + HALF_PERIOD_S
+                        pd_off = (min(off_cands, key=lambda x: abs(x - target))
+                                  if off_cands else target)
+                        if abs(pd_off - target) > win:
+                            pd_off = target
+                        onsets.append(pd_on)
+                        offsets.append(pd_off)
 
-        onsets = []
-        offsets = []
+                    onsets = np.array(onsets)
+                    offsets = np.array(offsets)
+                    keep = (onsets >= trim_front) & (offsets <= (len(signal) / fs - trim_end))
+                    onsets, offsets = onsets[keep], offsets[keep]
+                    print(f"\tDetected {len(onsets)} valid onset-offset pairs "
+                          f"(TTL grid: {len(ttl_rise)} edges).")
+                    return onsets, offsets
 
-        for i in range(1, len(signal)):
-            if above_mean[i] and not above_mean[i - 1]:
-                if time_vector[i] >= trim_front:
-                    onsets.append(time_vector[i])
-            elif not above_mean[i] and above_mean[i - 1]:
-                if time_vector[i] <= (time_vector[-1] - trim_end):
-                    offsets.append(time_vector[i])
+        # ---- photodiode-only fallback: cadence-lock + Allen reconciliation ----
+        gaps = np.diff(raw_times)
+        breaks = np.where(gaps > RUN_GAP_S)[0]
+        seg_bounds = np.concatenate([[0], breaks + 1, [raw_times.size]])
+        biggest = int(np.argmax(np.diff(seg_bounds)))
+        run = raw_times[seg_bounds[biggest]:seg_bounds[biggest + 1]]
+        if run.size < 4:
+            print("\tDetected 0 valid onset-offset pairs.")
+            return np.array([]), np.array([])
 
-        def refine_time(event_time, search_backward_ms=4):
-            search_backward = int(search_backward_ms * fs / 1000)  # Convert ms to samples
-            idx = np.searchsorted(time_vector, event_time) - 1
-            search_start = max(0, idx - search_backward)
-            search_region = second_derivative[search_start:idx]
+        d = np.diff(run)
+        band = (d > HALF_PERIOD_S * 0.7) & (d < HALF_PERIOD_S * 1.3)
+        run_gap = np.median(d[band]) if np.any(band) else HALF_PERIOD_S
+        on_cadence = np.abs(d - run_gap) < (LOCK_TOL * run_gap)
+        best_len = best_start = cur_len = cur_start = 0
+        for i, ok in enumerate(on_cadence):
+            if ok:
+                if cur_len == 0:
+                    cur_start = i
+                cur_len += 1
+                if cur_len > best_len:
+                    best_len, best_start = cur_len, cur_start
+            else:
+                cur_len = 0
+        if best_len < 3:
+            print("\tDetected 0 valid onset-offset pairs.")
+            return np.array([]), np.array([])
+        run = run[best_start: best_start + best_len + 1]
 
-            if len(search_region) > 0:
-                if signal[idx] > middle_mean:
-                    max_idx = np.argmin(search_region)  # Onset: steepest rise
-                else:
-                    max_idx = np.argmax(search_region)  # Offset: steepest fall
-                return time_vector[search_start + max_idx]
-            return event_time
+        fixed = fix_unexpected_edges(run, ndevs=NDEVS, cycle=1,
+                                     max_frame_offset=MAX_HALF_OFFSET)
+        fixed = correct_on_off_effects(fixed)
 
-        # Ensure onsets and offsets are correctly paired and refine times
-        paired_onsets = []
-        paired_offsets = []
-        offset_idx = 0
-        target_duration = 0.5  # 500ms
-        tolerance = 0.05  # 50ms
+        on_a, off_a = fixed[0::2], fixed[1::2]
+        on_b, off_b = fixed[1::2], fixed[2::2]
 
-        for onset in onsets:
-            while offset_idx < len(offsets) and offsets[offset_idx] < onset:
-                offset_idx += 1
-            if offset_idx < len(offsets):
-                duration = offsets[offset_idx] - onset
-                if abs(duration - target_duration) <= tolerance:
-                    refined_onset = refine_time(onset)
-                    refined_offset = refine_time(offsets[offset_idx])
-                    paired_onsets.append(refined_onset)
-                    paired_offsets.append(refined_offset)
-                offset_idx += 1
+        def score(on, off):
+            m = min(len(on), len(off))
+            return np.inf if m == 0 else np.abs(np.median(off[:m] - on[:m]) - HALF_PERIOD_S)
 
-        print(f"\tDetected {len(paired_onsets)} valid onset-offset pairs.")
-        return np.array(paired_onsets), np.array(paired_offsets)
+        if score(on_b, off_b) < score(on_a, off_a):
+            onsets, offsets = on_b, off_b
+        else:
+            onsets, offsets = on_a, off_a
 
-    def detect_sync_pulses(self, signal, threshold=None, pause_duration=3.0):
+        m = min(len(onsets), len(offsets))
+        onsets, offsets = onsets[:m], offsets[:m]
+        valid = (offsets - onsets) > (HALF_PERIOD_S * 0.5)
+        onsets, offsets = onsets[valid], offsets[valid]
+        keep = (onsets >= trim_front) & (offsets <= (len(signal) / fs - trim_end))
+        onsets, offsets = onsets[keep], offsets[keep]
+
+        print(f"\tDetected {len(onsets)} valid onset-offset pairs.")
+        return np.array(onsets), np.array(offsets)
+
+    def detect_sync_pulses(self, signal, threshold=None, pause_duration=0.7):
         """
         Detects the 10-second sync pulses in channel 8, ensuring only the first pulse
         in each burst is recorded, then pausing detection for a set duration.
@@ -457,6 +718,8 @@ class ProcessUnit:
         return good_units
 
     def load_nidaq(self):
+        # # todo updated this to run with the new TTL from the stimulus script, will probably break older data and
+        #    needs updating to be conditional
         """Loads the NIDAQ binary file and extracts the photodiode and sync pulse channels."""
         preprocessed_path = self.config["paths"]["preprocessed_NIDAQ"]
 
@@ -467,13 +730,19 @@ class ProcessUnit:
             self.nidaq_concat = sic.load(preprocessed_path)
 
             photodiode_signal = self.nidaq_concat.get_traces(channel_ids=['nidq#XA0']).flatten()
-            sync_pulse_signal = self.nidaq_concat.get_traces(channel_ids=['nidq#XD0']).flatten()
 
-            # Detect light onset times
-            light_onsets, light_offsets = self.detect_light_transitions(photodiode_signal)
+            # XD0 is a 16-bit digital word: bit 0 = 1s sync wave, bit 2 = stim TTL
+            xd0_raw = self.nidaq_concat.get_traces(channel_ids=['nidq#XD0']).flatten().astype(np.uint16)
+            sync_pulse_signal = ((xd0_raw & (1 << 0)) > 0).astype(np.uint8)
+            stim_ttl = ((xd0_raw & (1 << 2)) > 0).astype(np.uint8)  # None-safe: any()==False if unused
 
-            # Detect sync pulses every 10 seconds
+            # Detect light onset times (TTL grid when present, else photodiode cadence)
+            light_onsets, light_offsets = self.detect_light_transitions(
+                photodiode_signal, ttl=stim_ttl)
+
+            # Detect sync pulses every 10 seconds, using clean sync bit
             sync_pulses = self.detect_sync_pulses(sync_pulse_signal)
+
         else:
             print("Processing NIDAQ from raw data...")
             self.nidaq_recording = se.read_spikeglx(self.config["base_path"], stream_name='nidq')
@@ -482,16 +751,21 @@ class ProcessUnit:
             self.nidaq_concat = sic.concatenate_recordings([self.nidaq_recording])
 
             photodiode_signal = self.nidaq_concat.get_traces(channel_ids=['nidq#XA0']).flatten()
-            sync_pulse_signal = self.nidaq_concat.get_traces(channel_ids=['nidq#XD0']).flatten()
+
+            # XD0 is a 16-bit digital word: bit 0 = 1s sync wave, bit 2 = stim TTL
+            xd0_raw = self.nidaq_concat.get_traces(channel_ids=['nidq#XD0']).flatten().astype(np.uint16)
+            sync_pulse_signal = ((xd0_raw & (1 << 0)) > 0).astype(np.uint8)
+            stim_ttl = ((xd0_raw & (1 << 2)) > 0).astype(np.uint8)
 
             # Save if enabled
             if self.config["write_concat"]:
                 self.nidaq_concat = self.nidaq_concat.save(format="binary", folder=preprocessed_path)
 
-            # Detect light onset times
-            light_onsets, light_offsets = self.detect_light_transitions(photodiode_signal)
+            # Detect light onset times (TTL grid when present, else photodiode cadence)
+            light_onsets, light_offsets = self.detect_light_transitions(
+                photodiode_signal, ttl=stim_ttl)
 
-            # Detect sync pulses every 10 seconds
+            # Detect sync wave
             sync_pulses = self.detect_sync_pulses(sync_pulse_signal)
 
         # Ensure nidaq_data is assigned in both cases
@@ -500,7 +774,7 @@ class ProcessUnit:
             "sync_pulse": sync_pulse_signal,
             "light_onsets": light_onsets,
             "light_offsets": light_offsets,
-            "sync_pulses": sync_pulses
+            "sync_pulses": sync_pulses,
         }
         print("NIDAQ data loaded and processed.")
 
@@ -586,19 +860,20 @@ class ProcessUnit:
         # Swaps photodiode onset for TTL onset
         # ---------------------------------------
         # Detect rising edges of the stimulus TTL (bit 2 of XD0) to get stimulus start times in NIDAQ clock
-        stim_binary = stim_trace.astype(np.uint8)
-        stim_rise_idx = np.where(np.diff(stim_binary) == 1)[0] + 1
-        stim_onsets_nidq = xd0_time[stim_rise_idx]
-
-        # Overwrite the photodiode-based onsets with TTL-based onsets
-        # Keep offsets as-is (photodiode) so segment ends still come from measured light offset
-        if hasattr(self, "nidaq_data"):
-            self.nidaq_data["light_onsets"] = stim_onsets_nidq
-        else:
-            # safety fallback, but in your call order load_nidaq() already ran so nidaq_data exists
-            self.nidaq_data = {
-                "light_onsets": stim_onsets_nidq,
-            }
+        # stim_binary = stim_trace.astype(np.uint8)
+        # stim_rise_idx = np.where(np.diff(stim_binary) == 1)[0] + 1
+        # stim_onsets_nidq = xd0_time[stim_rise_idx]
+        #
+        # # Overwrite the photodiode-based onsets with TTL-based onsets
+        # # Keep offsets as-is (photodiode) so segment ends still come from measured light offset
+        # # todo this block breaks code from before the ttl was used, make it conditional
+        # if hasattr(self, "nidaq_data"):
+        #     self.nidaq_data["light_onsets"] = stim_onsets_nidq
+        # else:
+        #     # safety fallback, but in your call order load_nidaq() already ran so nidaq_data exists
+        #     self.nidaq_data = {
+        #         "light_onsets": stim_onsets_nidq,
+        #     }
         # ------------------------------------
 
         xd0_time = np.arange(len(sync_trace)) / nidq_fs
@@ -1109,7 +1384,7 @@ class ProcessUnit:
 
         plt.close(fig_temp)
         # Defines tick labels and range (mV), include to define range and hide labels
-        # ax.set_ylim(60, -90)
+        ax.set_ylim(20, -30)
         ax.set_xticks([])
         # ax.set_yticklabels([])
         ax.set_ylabel("mV", fontsize=4, rotation=0, labelpad=2)
@@ -1394,27 +1669,22 @@ class ProcessUnit:
         offsets = self.nidaq_data["light_offsets"]
 
         nidq_pulse_times = self.square_wave_alignment["nidq_times"]
-        offsets_ap_nidq = self.square_wave_alignment["offsets"]
+        ap_pulse_times = self.square_wave_alignment["ap_times"]
 
-        adjusted_onsets = []
-        adjusted_offsets = []
+        # Map NIDAQ event times onto the AP clock by LINEAR INTERPOLATION between
+        # the bracketing shared sync pulses, rather than applying one nearest
+        # per-pulse offset. The two clocks drift measurably across a recording
+        # (observed ~1200 ppm -> ~0.8 s accumulated over 10 min), and that drift
+        # is linear within each 1 s interval, so interpolation tracks it while a
+        # nearest-offset step does not. np.interp clamps outside the pulse span.
+        adjusted_onsets = np.interp(onsets, nidq_pulse_times, ap_pulse_times)
+        adjusted_offsets = np.interp(offsets, nidq_pulse_times, ap_pulse_times)
 
-        for i, onset in enumerate(onsets):
-            idx = np.searchsorted(nidq_pulse_times, onset, side='right') - 1
+        self.nidaq_data["light_onsets"] = adjusted_onsets
+        self.nidaq_data["light_offsets"] = adjusted_offsets
 
-            if idx < 0:
-                idx = 0  # Apply first correction if before first pulse
-            elif idx >= len(offsets_ap_nidq):
-                raise ValueError(f"Onset at {onset:.3f}s after final sync pulse.")
-
-            correction = offsets_ap_nidq[idx]
-            adjusted_onsets.append(onset - correction)
-            adjusted_offsets.append(offsets[i] - correction)
-
-        self.nidaq_data["light_onsets"] = np.array(adjusted_onsets)
-        self.nidaq_data["light_offsets"] = np.array(adjusted_offsets)
-
-        print(f"Adjusted {len(adjusted_onsets)} photodiode events into AP time base.")
+        print(f"Adjusted {len(adjusted_onsets)} photodiode events into AP time base "
+              f"(interpolated between {len(nidq_pulse_times)} sync pulses).")
 
     def verify_stimulus_alignment(self):
         """Verifies that the number of stimulus directions matches the number of onset/offset pairs."""
@@ -1467,21 +1737,56 @@ class ProcessUnit:
         plt.tight_layout()
         plt.show()
 
+    def plot_probe_shanks_debug(self, shank_ids_override=None):
+        if self.unique_shanks is None:
+            raise RuntimeError("Call load_recording() first.")
+        matplotlib.use("TkAgg")
+        probe = self.recording.get_probe()
+
+        if shank_ids_override is None:
+            try:
+                shank_ids = np.asarray(probe.shank_ids)
+            except Exception:
+                shank_ids = np.zeros(self.recording.get_num_channels(), dtype=int)
+        else:
+            shank_ids = np.asarray(shank_ids_override)
+
+        palette = plt.get_cmap("tab10")
+        colors = [palette(int(s) % 10) for s in shank_ids]
+
+        fig, ax = plt.subplots(figsize=(5 + 1.0 * max(1, len(self.unique_shanks)), 10))
+        plot_probe(probe, ax=ax, contacts_colors=colors,
+                   probe_shape_kwargs=dict(edgecolor="black", facecolor="white", linewidth=0.2))
+        ax.set_title(f"Probe geometry by shank {self.unique_shanks}")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.tight_layout()
+        plt.show()
+
+    def _infer_shanks_from_x(self, tol_um=15.0):
+        probe = self.recording.get_probe()
+        pos = np.asarray(probe.contact_positions)  # shape (n, 2)
+        x = pos[:, 0]
+        xq = np.round(x / tol_um) * tol_um  # quantize to collapse each column
+        uniq = np.sort(np.unique(xq))
+        rank = {u: i for i, u in enumerate(uniq)}
+        return np.array([rank[v] for v in xq], dtype=int)
+
 
 def configure_experiment():
     """Defines experiment metadata and paths."""
     config = {
-        "rerun": False,
+        "rerun": True,
         "sglx_folder": "SGL_DATA",
-        "mouse_id": "Mouse03",
-        "gate": "5",
+        "mouse_id": "mouse05",
+        "gate": "0",
         "probe": "0",
         "skip_sort": True,
         "write_concat": False,
         "processing_folder": "processing",
         "show_plot": False,
         "insertion_depth": 3000,
-        "run_phy": False
+        "run_phy": True
     }
 
     # Define paths **after** initializing config
